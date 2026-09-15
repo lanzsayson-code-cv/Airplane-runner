@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Airplane Runner</title>
+<style>
+  :root { --bg:#f7f7f7; --fg:#535353; --hint:#1a73e8; }
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg);color:var(--fg);
+    display:flex;align-items:center;justify-content:center;
+    font-family:"Courier New",Courier,monospace;
+    overflow:hidden;-webkit-user-select:none;user-select:none;
+    touch-action:manipulation;transition:background .18s linear;
+  }
+  body.night{--bg:#1c1c1c;--fg:#f2f2f2;--hint:#8ab4f8}
+  #wrap{width:100%;max-width:820px;padding:16px;box-sizing:border-box}
+  canvas{width:100%;height:auto;display:block;image-rendering:pixelated;image-rendering:crisp-edges}
+  #hint{
+    margin-top:20px;font-size:18px;line-height:1.9;
+    color:var(--hint);opacity:1;text-align:center;letter-spacing:.3px;
+  }
+  #hint b{
+    font-weight:700;border:2px solid var(--hint);
+    border-radius:5px;padding:1px 7px;
+  }
+  @media (max-width:520px){ #hint{font-size:14px} #hint b{padding:1px 5px} }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" aria-label="Airplane runner game"></canvas>
+  <div id="hint">
+    <b>Space</b> / <b>↑</b> / tap to jump &nbsp;·&nbsp; hold for a higher hop &nbsp;·&nbsp; <b>↓</b> to drop fast &nbsp;·&nbsp; <b>M</b> mutes
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+var cv  = document.getElementById('game');
+var ctx = cv.getContext('2d');
+
+var W = 640, H = 180, GROUND = 148;
+var P = 2; // sprite pixel size
+
+function resize(){
+  var dpr = Math.min(window.devicePixelRatio || 1, 3);
+  cv.width  = W * dpr;
+  cv.height = H * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.imageSmoothingEnabled = false;
+}
+resize();
+window.addEventListener('resize', resize);
+
+/* ---------- sprite: airplane, 24 x 12 cells, [row, colStart, colEnd] ---------- */
+var PLANE = [
+  [0,2,5],[1,2,6],[2,2,7],          // tail fin
+  [3,3,19],                          // fuselage top
+  [4,2,21],[5,2,22],[6,3,21],        // body + nose
+  [7,4,18],
+  [8,6,14],[9,5,12],[10,4,10],       // wing swept down-left
+  [11,7,8],[11,15,16]                // wheels
+];
+var PLANE_HOLES = [ [4,13,14], [4,17,19] ]; // windows + cockpit
+var PW = 24*P, PH = 12*P;
+
+function drawCells(cells, ox, oy, color){
+  ctx.fillStyle = color;
+  for (var i=0;i<cells.length;i++){
+    var c = cells[i];
+    ctx.fillRect(ox + c[1]*P, oy + c[0]*P, (c[2]-c[1]+1)*P, P);
+  }
+}
+
+/* ---------- state ---------- */
+var state='ready', speed=5.2, dist=0, score=0, hi=0;
+var blink=0, invert=false, nextInvert=500, muted=false, shake=0;
+var obstacles=[], clouds=[], dots=[], trail=[];
+var plane={x:64,y:GROUND-PH,vy:0,onGround:true};
+var held=false, fastFall=false;
+
+var GRAV=0.55, JUMP=-10.6;
+
+function rnd(a,b){ return a + Math.random()*(b-a); }
+function irnd(a,b){ return Math.floor(rnd(a,b+1)); }
+
+function initScenery(){
+  dots=[]; clouds=[];
+  for (var x=0; x<W+40; x += rnd(14,40))
+    dots.push({x:x, y:rnd(2,7), w:irnd(1,3)});
+  for (var i=0;i<3;i++)
+    clouds.push({x:rnd(0,W), y:rnd(14,64)});
+}
+
+function reset(){
+  state='running'; speed=5.2; dist=0; score=0; blink=0; shake=0;
+  invert=false; nextInvert=500; document.body.classList.remove('night');
+  obstacles=[]; trail=[];
+  plane.y=GROUND-PH; plane.vy=0; plane.onGround=true;
+  initScenery();
+}
+
+/* ---------- obstacles: clusters of skyscrapers ---------- */
+function spawn(){
+  // always a matched pair: same width, same height, same antenna
+  var bw = irnd(14,20);
+  var bh = irnd(28, speed > 8 ? 58 : 48);
+  var antenna = bh > 44;
+  var gap = 4;
+  var seed = Math.random();
+
+  var parts = [
+    {dx: 0,        w: bw, h: bh, antenna: antenna, seed: seed},
+    {dx: bw + gap, w: bw, h: bh, antenna: antenna, seed: seed}
+  ];
+  obstacles.push({x: W + 20, w: bw*2 + gap, parts: parts});
+}
+
+function drawBuilding(bx, b, fg, bg){
+  var by = GROUND - b.h;
+  if (b.antenna){
+    ctx.fillStyle = fg;
+    ctx.fillRect(bx + Math.floor(b.w/2), by-8, 2, 8);
+  }
+  ctx.fillStyle = fg;
+  ctx.fillRect(bx, by, b.w, b.h);
+
+  // punched-out windows
+  ctx.fillStyle = bg;
+  var cols = Math.floor((b.w-4)/5);
+  var rows = Math.floor((b.h-6)/6);
+  for (var r=0;r<rows;r++){
+    for (var c=0;c<cols;c++){
+      var lit = ((r*7 + c*3 + Math.floor(b.seed*10)) % 5) === 0;
+      if (lit) continue;
+      ctx.fillRect(bx + 3 + c*5, by + 4 + r*6, 2, 3);
+    }
+  }
+}
+
+/* ---------- sound ---------- */
+var AC=null;
+function beep(freq, dur, type){
+  if (muted) return;
+  try{
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'square';
+    o.frequency.value = freq;
+    g.gain.value = 0.035;
+    o.connect(g); g.connect(AC.destination);
+    o.start();
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.stop(AC.currentTime + dur);
+  }catch(e){}
+}
+
+/* ---------- input ---------- */
+function press(){
+  if (state === 'ready' || state === 'over'){ reset(); return; }
+  if (plane.onGround){
+    plane.vy = JUMP; plane.onGround = false; held = true;
+    trail = [];
+    beep(540, 0.07);
+  }
+}
+function release(){
+  held = false;
+  if (!plane.onGround && plane.vy < -4.2) plane.vy = -4.2; // short hop
+}
+
+window.addEventListener('keydown', function(e){
+  if (e.code==='Space' || e.code==='ArrowUp' || e.code==='KeyW'){ e.preventDefault(); if(!e.repeat) press(); }
+  else if (e.code==='ArrowDown' || e.code==='KeyS'){ e.preventDefault(); fastFall = true; }
+  else if (e.code==='KeyM'){ muted = !muted; }
+});
+window.addEventListener('keyup', function(e){
+  if (e.code==='Space' || e.code==='ArrowUp' || e.code==='KeyW') release();
+  else if (e.code==='ArrowDown' || e.code==='KeyS') fastFall = false;
+});
+cv.addEventListener('pointerdown', function(e){ e.preventDefault(); press(); });
+window.addEventListener('pointerup', function(){ release(); });
+
+/* ---------- loop ---------- */
+var last = 0;
+function loop(t){
+  var dt = last ? Math.min(2.5, (t - last)/16.667) : 1;
+  last = t;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+function update(dt){
+  if (state !== 'running') return;
+
+  speed = Math.min(11.6, speed + 0.0016*dt);
+  dist += speed*dt;
+
+  var ns = Math.floor(dist/22);
+  if (Math.floor(ns/100) > Math.floor(score/100)){ blink = 42; beep(900, 0.09); }
+  score = ns;
+
+  if (score >= nextInvert){
+    invert = !invert;
+    document.body.classList.toggle('night', invert);
+    nextInvert = score + (invert ? 320 : 520);
+  }
+
+  // plane physics
+  if (!plane.onGround){
+    plane.vy += GRAV * dt * (fastFall ? 2.8 : 1);
+    plane.vy = Math.min(plane.vy, 14);
+    plane.y  += plane.vy * dt;
+    if (plane.y >= GROUND - PH){
+      plane.y = GROUND - PH; plane.vy = 0; plane.onGround = true;
+    }
+  }
+
+  // contrail puffs
+  if (!plane.onGround && Math.random() < 0.35)
+    trail.push({x: plane.x + 2, y: plane.y + 10, life: 14});
+  for (var i=trail.length-1;i>=0;i--){
+    trail[i].x -= speed*dt*0.9;
+    trail[i].life -= dt;
+    if (trail[i].life <= 0) trail.splice(i,1);
+  }
+
+  // scenery
+  for (var d=0; d<dots.length; d++){
+    dots[d].x -= speed*dt;
+    if (dots[d].x < -6){ dots[d].x = W + rnd(0,30); dots[d].y = rnd(2,7); dots[d].w = irnd(1,3); }
+  }
+  for (var c=0; c<clouds.length; c++){
+    clouds[c].x -= speed*dt*0.35;
+    if (clouds[c].x < -50){ clouds[c].x = W + rnd(20,260); clouds[c].y = rnd(14,64); }
+  }
+
+  // obstacles
+  for (var o=obstacles.length-1;o>=0;o--){
+    obstacles[o].x -= speed*dt;
+    if (obstacles[o].x + obstacles[o].w < -20) obstacles.splice(o,1);
+  }
+  var lastOb = obstacles[obstacles.length-1];
+  if (!lastOb || (W - (lastOb.x + lastOb.w)) > 110 + speed*12 + Math.random()*speed*14) spawn();
+
+  // collision
+  var px = plane.x + 7, py = plane.y + 5, pw = PW - 14, ph = PH - 9;
+  for (var k=0;k<obstacles.length;k++){
+    var ob = obstacles[k];
+    for (var j=0;j<ob.parts.length;j++){
+      var b = ob.parts[j];
+      var bx = ob.x + b.dx + 1, by = GROUND - b.h, bw = b.w - 2;
+      if (px < bx + bw && px + pw > bx && py + ph > by){
+        state = 'over';
+        hi = Math.max(hi, score);
+        shake = 10;
+        beep(150, 0.3, 'sawtooth');
+        return;
+      }
+    }
+  }
+
+  if (blink > 0) blink -= dt;
+  if (shake > 0) shake -= dt;
+}
+
+function pad(n){ var s = String(n); while (s.length < 5) s = '0' + s; return s; }
+
+function render(){
+  var fg = invert ? '#f2f2f2' : '#535353';
+  var bg = invert ? '#1c1c1c' : '#f7f7f7';
+
+  ctx.setTransform(1,0,0,1,0,0);
+  var dpr = Math.min(window.devicePixelRatio || 1, 3);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = bg; ctx.fillRect(0,0,W,H);
+
+  if (shake > 0){
+    ctx.translate(Math.round(rnd(-1.5,1.5)), Math.round(rnd(-1.5,1.5)));
+  }
+
+  // clouds
+  ctx.fillStyle = fg;
+  for (var c=0;c<clouds.length;c++){
+    var cx = Math.round(clouds[c].x), cy = Math.round(clouds[c].y);
+    ctx.fillRect(cx+6, cy, 20, 2);
+    ctx.fillRect(cx+2, cy+2, 6, 2);  ctx.fillRect(cx+26, cy+2, 8, 2);
+    ctx.fillRect(cx, cy+4, 36, 2);
+  }
+
+  // ground
+  ctx.fillStyle = fg;
+  ctx.fillRect(0, GROUND, W, 2);
+  for (var d=0; d<dots.length; d++)
+    ctx.fillRect(Math.round(dots[d].x), GROUND + 3 + Math.round(dots[d].y), dots[d].w, 1);
+
+  // obstacles
+  for (var k=0;k<obstacles.length;k++){
+    var ob = obstacles[k];
+    for (var j=0;j<ob.parts.length;j++)
+      drawBuilding(Math.round(ob.x + ob.parts[j].dx), ob.parts[j], fg, bg);
+  }
+
+  // contrail
+  for (var i=0;i<trail.length;i++){
+    ctx.fillStyle = fg;
+    ctx.globalAlpha = Math.max(0, trail[i].life/18);
+    ctx.fillRect(Math.round(trail[i].x), Math.round(trail[i].y), 3, 2);
+    ctx.globalAlpha = 1;
+  }
+
+  // plane, pitched by vertical speed
+  var pitch = plane.onGround ? 0 : Math.max(-0.28, Math.min(0.38, plane.vy * 0.032));
+  if (state === 'over') pitch = 0.5;
+  ctx.save();
+  ctx.translate(Math.round(plane.x) + PW/2, Math.round(plane.y) + PH/2);
+  ctx.rotate(pitch);
+  ctx.translate(-PW/2, -PH/2);
+  drawCells(PLANE, 0, 0, fg);
+  drawCells(PLANE_HOLES, 0, 0, bg);
+  ctx.restore();
+
+  // score
+  ctx.font = 'bold 13px "Courier New", monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = fg;
+  if (hi > 0){
+    ctx.globalAlpha = 0.55;
+    ctx.fillText('HI ' + pad(hi), W - 96, 12);
+    ctx.globalAlpha = 1;
+  }
+  var showScore = (blink > 0 && Math.floor(blink/7) % 2 === 0) ? '' : pad(score);
+  ctx.fillText(showScore, W - 12, 12);
+
+  ctx.textAlign = 'center';
+  if (state === 'ready'){
+    ctx.font = 'bold 15px "Courier New", monospace';
+    ctx.fillText('P R E S S   S P A C E   T O   T A K E   O F F', W/2, 62);
+  } else if (state === 'over'){
+    ctx.font = 'bold 15px "Courier New", monospace';
+    ctx.fillText('G A M E   O V E R', W/2, 52);
+    ctx.font = 'bold 11px "Courier New", monospace';
+    ctx.globalAlpha = 0.7;
+    ctx.fillText('space or tap to fly again', W/2, 76);
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+
+initScenery();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
